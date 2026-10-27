@@ -150,6 +150,158 @@ video#cam{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;tran
 </section>
 
 <script>
+/* Convierte un MP4 fragmentado (el que produce Safari/MediaRecorder) en un MP4 normal
+   que cualquier galería (Android, Windows, WhatsApp) puede abrir.
+   No recodifica: solo reorganiza el índice. Trabaja sobre un Blob sin cargar el video entero en memoria. */
+async function defragMp4(blob){
+  const rd = async (off,len) => new DataView(await blob.slice(off,off+len).arrayBuffer());
+  const u32=(v,o)=>v.getUint32(o), type=(v,o)=>String.fromCharCode(v.getUint8(o),v.getUint8(o+1),v.getUint8(o+2),v.getUint8(o+3));
+
+  // 1. Cajas de nivel superior
+  const top=[]; let pos=0;
+  while(pos+8<=blob.size){
+    const h=await rd(pos,16); let size=u32(h,0), hdr=8; const t=type(h,4);
+    if(size===1){ size=Number(h.getBigUint64(8)); hdr=16; } else if(size===0){ size=blob.size-pos; }
+    if(size<8) break;
+    top.push({t,off:pos,size,hdr}); pos+=size;
+  }
+  const moovBox=top.find(b=>b.t==='moov');
+  if(!moovBox || !top.some(b=>b.t==='moof')) return blob;          // ya es normal
+  const moov=new Uint8Array(await blob.slice(moovBox.off,moovBox.off+moovBox.size).arrayBuffer());
+
+  // árbol de cajas para moov
+  const CONT=new Set(['moov','trak','mdia','minf','stbl','mvex','edts','dinf','moof','traf']);
+  function parse(buf,s,e){
+    const v=new DataView(buf.buffer,buf.byteOffset), out=[]; let i=s;
+    while(i+8<=e){
+      let size=v.getUint32(i), hdr=8; const t=type(v,i+4);
+      if(size===1){ size=Number(v.getBigUint64(i+8)); hdr=16; } else if(size===0) size=e-i;
+      const b={t, data:buf.subarray(i+hdr,i+size)};
+      if(CONT.has(t)) b.kids=parse(buf,i+hdr,i+size).map(k=>k);
+      out.push(b); i+=size;
+    }
+    return out;
+  }
+  const tree=parse(moov,8,moov.length);
+  const find=(arr,t)=>arr.find(b=>b.t===t);
+
+  // defaults de trex
+  const trex={};
+  const mvex=find(tree,'mvex');
+  if(mvex) for(const k of mvex.kids) if(k.t==='trex'){
+    const v=new DataView(k.data.buffer,k.data.byteOffset,k.data.length);
+    trex[v.getUint32(4)]={desc:v.getUint32(8),dur:v.getUint32(12),size:v.getUint32(16),flags:v.getUint32(20)};
+  }
+
+  // 2. Recorrer moof/mdat: muestras por pista
+  const tracks={};   // id -> {durs:[],sizes:[],sync:[],cto:[],chunks:[{off,n}],hasCto}
+  const mdats=[];    // {off(payload start),len, newStart}
+  let newPayload=0;
+  for(const b of top){
+    if(b.t==='mdat'){ mdats.push({off:b.off+b.hdr,len:b.size-b.hdr,newStart:newPayload}); newPayload+=b.size-b.hdr; continue; }
+    if(b.t!=='moof') continue;
+    const buf=new Uint8Array(await blob.slice(b.off,b.off+b.size).arrayBuffer());
+    const kids=parse(buf,b.hdr,buf.length);
+    for(const traf of kids.filter(k=>k.t==='traf')){
+      let id,base=b.off,dDur,dSize,dFlags;
+      for(const k of traf.kids){
+        const v=new DataView(k.data.buffer,k.data.byteOffset,k.data.length);
+        if(k.t==='tfhd'){
+          const fl=v.getUint32(0)&0xffffff; let o=4; id=v.getUint32(o); o+=4;
+          const tx=trex[id]||{dur:0,size:0,flags:0};
+          dDur=tx.dur; dSize=tx.size; dFlags=tx.flags;
+          if(fl&1){ base=Number(v.getBigUint64(o)); o+=8; }
+          if(fl&2) o+=4;
+          if(fl&8){ dDur=v.getUint32(o); o+=4; }
+          if(fl&0x10){ dSize=v.getUint32(o); o+=4; }
+          if(fl&0x20){ dFlags=v.getUint32(o); o+=4; }
+        } else if(k.t==='trun'){
+          const ver=v.getUint8(0), fl=v.getUint32(0)&0xffffff; let o=4;
+          const n=v.getUint32(o); o+=4;
+          let dataOff=0; if(fl&1){ dataOff=v.getInt32(o); o+=4; }
+          let first=null; if(fl&4){ first=v.getUint32(o); o+=4; }
+          const T=tracks[id]||(tracks[id]={durs:[],sizes:[],sync:[],cto:[],chunks:[],hasCto:false});
+          T.chunks.push({off:base+dataOff,n});
+          for(let s=0;s<n;s++){
+            const dur=(fl&0x100)?v.getUint32((o+=4)-4):dDur;
+            const size=(fl&0x200)?v.getUint32((o+=4)-4):dSize;
+            let f=(fl&0x400)?v.getUint32((o+=4)-4):dFlags; if(s===0&&first!==null) f=first;
+            let c=0; if(fl&0x800){ c=ver?v.getInt32(o):v.getUint32(o); o+=4; T.hasCto=true; }
+            T.durs.push(dur); T.sizes.push(size); T.sync.push(!(f&0x10000)); T.cto.push(c);
+          }
+        }
+      }
+    }
+  }
+  // offset viejo -> nuevo (dentro del mdat único)
+  const remap=old=>{ for(const m of mdats) if(old>=m.off && old<m.off+m.len) return old-m.off+m.newStart; return -1; };
+
+  // 3. Construir cajas
+  const box=(t,parts)=>{ let len=8; for(const p of parts) len+=p.length; const out=new Uint8Array(len), v=new DataView(out.buffer);
+    v.setUint32(0,len); for(let i=0;i<4;i++) out[4+i]=t.charCodeAt(i); let o=8; for(const p of parts){ out.set(p,o); o+=p.length; } return out; };
+  const u32a=arr=>{ const out=new Uint8Array(arr.length*4), v=new DataView(out.buffer); arr.forEach((x,i)=>v.setUint32(i*4,x>>>0)); return out; };
+  const full=(t,vals)=>box(t,[u32a(vals)]);
+  const ser=b=> b.kids ? box(b.t,b.kids.map(ser)) : box(b.t,[b.data]);
+  const setDur=(data,timescaleOff)=>{ /* devuelve copia */ return new Uint8Array(data); };
+
+  let mdatHdr=16;  // usamos mdat de 64 bits
+  function buildMoov(chunkBase){
+    const vh=find(tree,'mvhd'), vv=new DataView(vh.data.buffer,vh.data.byteOffset);
+    const mvVer=vh.data[0], mvTs=mvVer?vv.getUint32(20):vv.getUint32(12);
+    let movieDur=0;
+    const out=[];
+    for(const b of tree){
+      if(b.t==='mvex') continue;
+      if(b.t!=='trak'){ out.push(b); continue; }
+      const tk=find(b.kids,'tkhd'), tv=new DataView(tk.data.buffer,tk.data.byteOffset);
+      const id=tk.data[0]?tv.getUint32(20):tv.getUint32(12);
+      const T=tracks[id]; if(!T){ out.push(b); continue; }
+      const mdia=find(b.kids,'mdia'), mdhd=find(mdia.kids,'mdhd'), mv=new DataView(mdhd.data.buffer,mdhd.data.byteOffset);
+      const ts=mdhd.data[0]?mv.getUint32(20):mv.getUint32(12);
+      const total=T.durs.reduce((a,c)=>a+c,0);
+      // stts
+      const stts=[]; for(const d of T.durs){ const l=stts[stts.length-1]; if(l&&l[1]===d) l[0]++; else stts.push([1,d]); }
+      // stsc
+      const stsc=[]; T.chunks.forEach((c,i)=>{ const l=stsc[stsc.length-1]; if(!l||l[1]!==c.n) stsc.push([i+1,c.n,1]); });
+      const offs=T.chunks.map(c=>chunkBase+remap(c.off));
+      const stco=box('co64',[u32a([0,offs.length]), (()=>{const a=new Uint8Array(offs.length*8),v=new DataView(a.buffer);offs.forEach((x,i)=>v.setBigUint64(i*8,BigInt(x)));return a;})()]);
+      const stblKids=[];
+      const stbl=find(find(mdia.kids,'minf').kids,'stbl');
+      stblKids.push(ser(find(stbl.kids,'stsd')));
+      stblKids.push(full('stts',[0,stts.length,...stts.flat()]));
+      if(T.hasCto){ const ct=[]; for(const c of T.cto){ const l=ct[ct.length-1]; if(l&&l[1]===c) l[0]++; else ct.push([1,c]); } stblKids.push(full('ctts',[0,ct.length,...ct.flat()])); }
+      if(T.sync.some(s=>!s)){ const ss=[]; T.sync.forEach((s,i)=>{ if(s) ss.push(i+1); }); stblKids.push(full('stss',[0,ss.length,...ss])); }
+      stblKids.push(full('stsc',[0,stsc.length,...stsc.flat()]));
+      stblKids.push(full('stsz',[0,0,T.sizes.length,...T.sizes]));
+      stblKids.push(stco);
+      const newStbl=box('stbl',stblKids);
+      // copiar con duraciones
+      const mdhdC=new Uint8Array(mdhd.data), mcv=new DataView(mdhdC.buffer);
+      if(mdhdC[0]) mcv.setBigUint64(24,BigInt(total)); else mcv.setUint32(16,total>>>0);
+      const tkC=new Uint8Array(tk.data), tcv=new DataView(tkC.buffer);
+      const tDur=Math.round(total*mvTs/ts); movieDur=Math.max(movieDur,tDur);
+      if(tkC[0]) tcv.setBigUint64(28,BigInt(tDur)); else tcv.setUint32(20,tDur>>>0);
+      const minf=find(mdia.kids,'minf');
+      const newMinf=box('minf',minf.kids.map(k=>k.t==='stbl'?newStbl:ser(k)));
+      const newMdia=box('mdia',mdia.kids.map(k=>k.t==='mdhd'?box('mdhd',[mdhdC]):k.t==='minf'?newMinf:ser(k)));
+      out.push({raw:box('trak',b.kids.filter(k=>k.t!=='edts').map(k=>k.t==='tkhd'?box('tkhd',[tkC]):k.t==='mdia'?newMdia:ser(k)))});
+    }
+    const mvC=new Uint8Array(vh.data), mvc=new DataView(mvC.buffer);
+    if(mvVer) mvc.setBigUint64(24,BigInt(movieDur)); else mvc.setUint32(16,movieDur>>>0);
+    return box('moov',out.map(b=>b.raw?b.raw:b.t==='mvhd'?box('mvhd',[mvC]):ser(b)));
+  }
+  const ftyp=box('ftyp',[new TextEncoder().encode('isom'),u32a([0x200]),new TextEncoder().encode('isomiso2avc1mp41')]);
+  // dos pasadas: el tamaño del moov no depende de los offsets (co64 de 8 bytes fijos)
+  let moovOut=buildMoov(0);
+  const base=ftyp.length+moovOut.length+mdatHdr;
+  moovOut=buildMoov(base);
+  const mh=new Uint8Array(16), mhv=new DataView(mh.buffer);
+  mhv.setUint32(0,1); mh.set([0x6d,0x64,0x61,0x74],4); mhv.setBigUint64(8,BigInt(16+newPayload));
+  const parts=[ftyp,moovOut,mh];
+  for(const m of mdats) parts.push(blob.slice(m.off,m.off+m.len));
+  return new Blob(parts,{type:'video/mp4'});
+}
+
 (function(){
 const $ = id => document.getElementById(id);
 const store = {
@@ -216,9 +368,17 @@ function stopRecording(){
   setPlaying(false);
 }
 const isRec = () => recorder && recorder.state==='recording';
-function showReview(){
+async function showReview(){
   const type = (recorder && recorder.mimeType) || mime || 'video/mp4';
   lastBlob = new Blob(chunks,{type}); chunks=[];
+  closeCamera(); keepAwake(false);
+  $('prompter').hidden=true; $('review').hidden=false;
+  $('revMsg').className='msg'; $('revMsg').textContent='Preparando el video…';
+  $('save').disabled=true;
+  if(type.includes('mp4')){
+    try{ lastBlob = await defragMp4(lastBlob); }catch(e){ console.warn('defrag', e); }
+  }
+  $('save').disabled=false;
   const ext = type.includes('webm') ? 'webm' : 'mp4';
   if(lastUrl) URL.revokeObjectURL(lastUrl);
   lastUrl = URL.createObjectURL(lastBlob);
@@ -227,8 +387,6 @@ function showReview(){
   const mb = (lastBlob.size/1048576).toFixed(0);
   $('revMsg').className='msg';
   $('revMsg').textContent = 'Duración '+fmt((Date.now()-recStart)/1000)+' · '+mb+' MB. Guárdalo antes de salir: si cierras la página, el video se pierde.';
-  closeCamera(); keepAwake(false);
-  $('prompter').hidden=true; $('review').hidden=false;
 }
 $('save').onclick = async ()=>{
   if(!lastBlob) return;
