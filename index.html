@@ -106,6 +106,10 @@ video#cam{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;tran
     <div class="set"><label for="cuePos">Línea de lectura</label><input type="range" id="cuePos" min="6" max="50" step="1" value="14"><span class="val" id="cueVal"></span></div>
     <div class="set"><div class="toggle"><label for="mirror">Modo espejo</label><input type="checkbox" id="mirror"></div><span class="hint">Para cristal de teleprompter</span></div>
   </div>
+  <div class="row" id="resumeRow" hidden>
+    <span class="hint" id="resumeTxt" style="align-self:center"></span>
+    <button class="chip" id="fromStart" type="button">Empezar desde el inicio</button>
+  </div>
   <button class="go" id="startCam" type="button">Abrir cámara y grabar</button>
   <button class="go alt" id="startRead" type="button">Solo leer, sin grabar</button>
   <p class="hint">Toca la pantalla para pausar o seguir el texto. Desliza con el dedo para avanzar o retroceder. Deja la línea amarilla arriba, cerca de la cámara frontal.</p>
@@ -325,19 +329,29 @@ function updateEditor(){
   $('speedVal').textContent = speed.value; $('sizeVal').textContent = size.value+' px';
   $('cueVal').textContent = cuePos.value+'% desde arriba';
 }
-ta.addEventListener('input',()=>{store.set('text',ta.value);updateEditor();});
+/* posición donde quedó la última grabación (fracción del texto), ligada a este texto */
+const textKey = t => { let h=0; for(let i=0;i<t.length;i++) h=(h*31+t.charCodeAt(i))|0; return t.length+':'+h; };
+function getResume(){ try{ const r=JSON.parse(store.get('resume','null')); if(r && r.key===textKey(ta.value.trim())) return r.frac; }catch(e){} return 0; }
+function setResume(frac){ store.set('resume', JSON.stringify({key:textKey(ta.value.trim()), frac:Math.max(0,frac)})); showResume(); }
+function showResume(){
+  const f=getResume();
+  $('resumeRow').hidden = !(f>0.005);
+  $('resumeTxt').textContent = 'Continúas donde quedaste ('+Math.round(f*100)+'% del texto).';
+}
+$('fromStart').onclick=()=>setResume(0);
+ta.addEventListener('input',()=>{store.set('text',ta.value);updateEditor();showResume();});
 speed.addEventListener('input',()=>{store.set('speed',speed.value);updateEditor();});
 size.addEventListener('input',()=>{store.set('size',size.value);updateEditor();});
 cuePos.addEventListener('input',()=>{store.set('cue',cuePos.value);updateEditor();});
 mirror.addEventListener('change',()=>store.set('mirror',mirror.checked?'1':'0'));
-updateEditor();
+updateEditor(); showResume();
 let undoText='', undoTimer=0;
 $('clear').onclick=()=>{
   if(!ta.value) { ta.focus(); return; }
-  undoText=ta.value; ta.value=''; store.set('text',''); updateEditor(); ta.focus();
+  undoText=ta.value; ta.value=''; store.set('text',''); updateEditor(); showResume(); ta.focus();
   $('undo').hidden=false; clearTimeout(undoTimer); undoTimer=setTimeout(()=>$('undo').hidden=true,8000);
 };
-$('undo').onclick=()=>{ ta.value=undoText; store.set('text',undoText); updateEditor(); $('undo').hidden=true; };
+$('undo').onclick=()=>{ ta.value=undoText; store.set('text',undoText); updateEditor(); showResume(); $('undo').hidden=true; };
 
 /* ---------- Camera + recording ---------- */
 let stream=null, recorder=null, chunks=[], recStart=0, recTimer=0, lastBlob=null, lastUrl=null, mime='';
@@ -369,7 +383,13 @@ function startRecording(){
   recTimer=setInterval(()=>$('recTime').textContent=fmt((Date.now()-recStart)/1000),500);
   return true;
 }
+function savePos(){
+  if(!flow.scrollHeight) return;
+  const back = (+size.value)*1.32;   // retrocede una línea para retomar con contexto
+  setResume(Math.max(0,pos-back)/flow.scrollHeight);
+}
 function stopRecording(){
+  savePos();
   if(recorder && recorder.state!=='inactive') recorder.stop();
   clearInterval(recTimer); $('badge').hidden=true; $('rec').classList.remove('on');
   setPlaying(false);
@@ -417,7 +437,7 @@ $('discardConfirm').onclick=()=>{ $('discard').hidden=false;$('discardConfirm').
 
 /* ---------- Prompter engine ---------- */
 const P=$('prompter'), flow=$('flow'), flip=$('flip');
-let pos=0, playing=false, last=0, raf=0, wake=null, countTimer=0, camMode=false, dragging=false;
+let wasStarted=false, pos=0, playing=false, last=0, raf=0, wake=null, countTimer=0, camMode=false, dragging=false;
 const pxs = () => +speed.value*6;
 const cueY = () => P.clientHeight*(+cuePos.value/100);
 const maxPos = () => Math.max(0, flow.scrollHeight - P.clientHeight*0.1);
@@ -454,6 +474,7 @@ async function keepAwake(on){
   }catch(e){ wake=null; }
 }
 function setPlaying(on){
+  if(on) wasStarted=true;
   playing=on; $('play').textContent = on ? 'Pausa' : 'Leer';
   cancelAnimationFrame(raf);
   if(on){ last=0; raf=requestAnimationFrame(loop); }
@@ -471,6 +492,7 @@ function fillText(){
 async function enterPrompter(withCam){
   camMode = withCam; fillText();
   $('editor').hidden=true; P.hidden=false; pos=0; setPlaying(false);
+  const resumeFrac=getResume(); wasStarted=false;
   $('rec').hidden = !withCam; $('cam').hidden = !withCam;
   keepAwake(true);
   if(withCam){
@@ -480,19 +502,19 @@ async function enterPrompter(withCam){
       alert('No se pudo abrir la cámara. Revisa en Ajustes › Safari › Cámara y Micrófono que estén en "Preguntar" o "Permitir", y vuelve a intentarlo.');
     }
   }
-  requestAnimationFrame(layout);
+  requestAnimationFrame(()=>{ layout(); pos=resumeFrac*flow.scrollHeight; render(); });
 }
 function exitPrompter(){
   if(isRec()){ stopRecording(); return; } // goes to review
   clearInterval(countTimer); $('count').hidden=true;
-  setPlaying(false); closeCamera(); keepAwake(false);
+  setPlaying(false); savePos(); closeCamera(); keepAwake(false);
   P.hidden=true; $('editor').hidden=false;
 }
 $('startCam').onclick=()=>enterPrompter(true);
 $('startRead').onclick=()=>enterPrompter(false);
 $('exit').onclick=exitPrompter;
-$('play').onclick=()=>{ if(!$('count').hidden) return; if(!playing && pos===0) countdown(()=>setPlaying(true)); else setPlaying(!playing); };
-$('restart').onclick=()=>{ setPlaying(false); pos=0; render(); };
+$('play').onclick=()=>{ if(!$('count').hidden) return; if(!playing && !wasStarted) countdown(()=>setPlaying(true)); else setPlaying(!playing); };
+$('restart').onclick=()=>{ setPlaying(false); pos=0; render(); setResume(0); };
 $('rec').onclick=()=>{
   if(!$('count').hidden) return;
   if(isRec()){ stopRecording(); return; }
