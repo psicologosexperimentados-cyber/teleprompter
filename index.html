@@ -48,6 +48,13 @@ input[type=range]{width:100%;accent-color:var(--cue)}
 .go{background:var(--cue);color:var(--cue-ink);border:0;border-radius:12px;padding:16px;font-size:1.15rem;font-weight:700}
 .go.alt{background:var(--panel);color:var(--fg);border:1px solid var(--line);font-size:1rem;padding:12px}
 .hint{font-size:.82rem;color:var(--muted);margin:0;line-height:1.45}
+.voice{grid-column:1/-1;flex-direction:row;align-items:center;justify-content:space-between;gap:10px}
+.vtog{background:transparent;border:1.5px solid var(--line);border-radius:999px;padding:10px 16px;font-size:1rem;font-weight:700;color:var(--muted);white-space:nowrap}
+.vtog[aria-pressed=true]{border-color:var(--cue);color:var(--cue)}
+.vstat{position:absolute;z-index:6;top:calc(10px + env(safe-area-inset-top));left:max(12px,env(safe-area-inset-left));
+  background:rgba(0,0,0,.6);border-radius:999px;padding:6px 12px;font-family:var(--font-data);font-size:.85rem;color:var(--muted);pointer-events:none}
+.vstat.on{color:#7ee08a}
+.btn.vbtn[aria-pressed=false]{opacity:.45}
 
 /* Prompter */
 .prompter{position:fixed;inset:0;background:#000;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none}
@@ -105,6 +112,7 @@ video#cam{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;tran
     <div class="set"><label for="size">Tamaño de letra</label><input type="range" id="size" min="20" max="96" step="2" value="38"><span class="val" id="sizeVal"></span></div>
     <div class="set"><label for="cuePos">Línea de lectura</label><input type="range" id="cuePos" min="6" max="50" step="1" value="14"><span class="val" id="cueVal"></span></div>
     <div class="set"><div class="toggle"><label for="mirror">Modo espejo</label><input type="checkbox" id="mirror"></div><span class="hint">Para cristal de teleprompter</span></div>
+    <div class="set voice"><span class="hint">El texto avanza mientras hablas y te espera cuando te callas.</span><button class="vtog" id="voiceTog" type="button" aria-pressed="true">🎤 Avanza con mi voz: Sí</button></div>
   </div>
   <div class="row" id="resumeRow" hidden>
     <span class="hint" id="resumeTxt" style="align-self:center"></span>
@@ -121,11 +129,13 @@ video#cam{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;tran
   <div class="cue" id="cue"></div>
   <div class="flip" id="flip"><div class="flow" id="flow"></div></div>
   <div class="count" id="count" hidden></div>
+  <div class="vstat" id="vstat" hidden>Esperando tu voz</div>
   <div class="badge" id="badge" hidden><i></i><span id="recTime">0:00</span></div>
   <div class="bar" id="bar">
     <div class="grp">
       <button class="btn" id="exit" type="button" aria-label="Salir">✕</button>
       <span class="time" id="remain">0:00</span>
+      <button class="btn vbtn" id="voiceBtn" type="button" aria-label="Avanzar con mi voz" aria-pressed="true">🎤</button>
     </div>
     <div class="grp">
       <button class="btn" id="slower" type="button" aria-label="Más lento">−</button>
@@ -353,7 +363,88 @@ $('clear').onclick=()=>{
 };
 $('undo').onclick=()=>{ ta.value=undoText; store.set('text',undoText); updateEditor(); showResume(); $('undo').hidden=true; };
 
+/* ---------- Avanzar con la voz (mide el volumen, no reconoce palabras) ---------- */
+let voiceOn = store.get('voice','1')==='1';
+let actx=null, vsrc=null, vana=null, vbuf=null, vtimer=0, voiceStream=null, voiceReady=false, voiceSpeaking=false;
+const Gate = {
+  buf:[], noise:0.004, thr:0.012, last:-1e9, cons:0, lastCalc:0, HOLD:700,
+  reset(){ this.buf=[]; this.noise=0.004; this.thr=0.012; this.last=-1e9; this.cons=0; this.lastCalc=0; },
+  feed(level, now){
+    this.buf.push(level); if(this.buf.length>120) this.buf.shift();
+    if(this.buf.length>=20 && now-this.lastCalc>500){
+      const s=this.buf.slice().sort((a,b)=>a-b);
+      this.noise=Math.min(0.05, s[Math.floor(s.length*0.15)]);
+      this.lastCalc=now;
+    }
+    this.thr=Math.max(0.01, this.noise*2.2+0.004);
+    if(level>this.thr){ this.cons++; if(this.cons>=2 || (now-this.last)<this.HOLD) this.last=now; } else this.cons=0;
+    return (now-this.last)<this.HOLD;
+  }
+};
+function primeAudio(){
+  try{
+    const AC=window.AudioContext||window.webkitAudioContext;
+    if(!AC) return;
+    if(!actx) actx=new AC();
+    if(actx.state==='suspended') actx.resume();
+  }catch(e){}
+}
+function showVoiceStat(){
+  const el=$('vstat');
+  el.hidden = !(voiceOn && voiceReady && playing);
+  el.textContent = voiceSpeaking ? 'Te escucho' : 'Esperando tu voz';
+  el.classList.toggle('on', voiceSpeaking);
+}
+function stopVoice(){
+  clearInterval(vtimer); vtimer=0;
+  try{ if(vsrc) vsrc.disconnect(); }catch(e){}
+  vsrc=null; vana=null; voiceReady=false; voiceSpeaking=false;
+  if(voiceStream){ voiceStream.getTracks().forEach(t=>t.stop()); voiceStream=null; }
+  $('vstat').hidden=true;
+}
+async function startVoice(){
+  stopVoice();
+  if(!voiceOn) return;
+  primeAudio();
+  if(!actx) return;
+  try{
+    let src = stream && stream.getAudioTracks().length ? stream : null;     // mismo micrófono de la grabación
+    if(!src){
+      voiceStream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true, noiseSuppression:true}});
+      src = voiceStream;
+    }
+    if(!voiceOn || P.hidden){ stopVoice(); return; }
+    vsrc = actx.createMediaStreamSource(src);
+    vana = actx.createAnalyser(); vana.fftSize=2048; vana.smoothingTimeConstant=0;
+    vsrc.connect(vana);                                                       // no se conecta a la salida: no suena ni toca la grabación
+    vbuf = new Uint8Array(vana.fftSize);
+    Gate.reset(); voiceReady=true;
+    vtimer=setInterval(()=>{
+      if(!vana) return;
+      vana.getByteTimeDomainData(vbuf);
+      let sum=0; for(let i=0;i<vbuf.length;i++){ const d=(vbuf[i]-128)/128; sum+=d*d; }
+      voiceSpeaking = Gate.feed(Math.sqrt(sum/vbuf.length), performance.now());
+      showVoiceStat();
+    },50);
+  }catch(e){ stopVoice(); }   // sin micrófono: el texto sigue avanzando normal
+}
+function syncVoiceUI(){
+  $('voiceTog').textContent='🎤 Avanza con mi voz: '+(voiceOn?'Sí':'No');
+  $('voiceTog').setAttribute('aria-pressed',voiceOn?'true':'false');
+  $('voiceBtn').setAttribute('aria-pressed',voiceOn?'true':'false');
+}
+function toggleVoice(){
+  voiceOn=!voiceOn; store.set('voice',voiceOn?'1':'0'); syncVoiceUI();
+  primeAudio();
+  if(!P.hidden){ if(voiceOn) startVoice(); else stopVoice(); }
+}
+$('voiceTog').onclick=toggleVoice;
+$('voiceBtn').onclick=toggleVoice;
+syncVoiceUI();
+document.addEventListener('visibilitychange',()=>{ if(!document.hidden && actx && actx.state==='suspended') actx.resume(); });
+
 /* ---------- Camera + recording ---------- */
+const P=$('prompter'), flow=$('flow'), flip=$('flip');
 let stream=null, recorder=null, chunks=[], recStart=0, recTimer=0, lastBlob=null, lastUrl=null, mime='';
 async function openCamera(){
   stream = await navigator.mediaDevices.getUserMedia({
@@ -362,7 +453,7 @@ async function openCamera(){
   });
   const v=$('cam'); v.srcObject=stream; v.hidden=false; await v.play().catch(()=>{});
 }
-function closeCamera(){ if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; } $('cam').srcObject=null; }
+function closeCamera(){ stopVoice(); if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; } $('cam').srcObject=null; }
 function pickMime(){
   const opts=['video/mp4;codecs=avc1,mp4a','video/mp4','video/webm;codecs=vp9,opus','video/webm'];
   if(!window.MediaRecorder) return null;
@@ -436,7 +527,6 @@ $('discardConfirm').onclick=()=>{ $('discard').hidden=false;$('discardConfirm').
   $('review').hidden=true; $('editor').hidden=false; };
 
 /* ---------- Prompter engine ---------- */
-const P=$('prompter'), flow=$('flow'), flip=$('flip');
 let wasStarted=false, pos=0, playing=false, last=0, raf=0, wake=null, countTimer=0, camMode=false, dragging=false;
 const pxs = () => +speed.value*6;
 const cueY = () => P.clientHeight*(+cuePos.value/100);
@@ -462,7 +552,7 @@ function layout(){
 function loop(t){
   if(!playing) return;
   const dt = last ? (t-last)/1000 : 0; last=t;
-  if(!dragging) pos+=pxs()*dt;
+  if(!dragging && (!(voiceOn && voiceReady) || voiceSpeaking)) pos+=pxs()*dt;
   render();
   if(pos>=maxPos()){ setPlaying(false); return; }
   raf=requestAnimationFrame(loop);
@@ -475,7 +565,7 @@ async function keepAwake(on){
 }
 function setPlaying(on){
   if(on) wasStarted=true;
-  playing=on; $('play').textContent = on ? 'Pausa' : 'Leer';
+  playing=on; $('play').textContent = on ? 'Pausa' : 'Leer'; showVoiceStat();
   cancelAnimationFrame(raf);
   if(on){ last=0; raf=requestAnimationFrame(loop); }
 }
@@ -490,7 +580,7 @@ function fillText(){
   text.split(/\n\s*\n/).forEach(par=>{ const p=document.createElement('p'); p.textContent=par.trim(); flow.appendChild(p); });
 }
 async function enterPrompter(withCam){
-  camMode = withCam; fillText();
+  camMode = withCam; fillText(); primeAudio();
   $('editor').hidden=true; P.hidden=false; pos=0; setPlaying(false);
   const resumeFrac=getResume(); wasStarted=false;
   $('rec').hidden = !withCam; $('cam').hidden = !withCam;
@@ -503,6 +593,7 @@ async function enterPrompter(withCam){
     }
   }
   requestAnimationFrame(()=>{ layout(); pos=resumeFrac*flow.scrollHeight; render(); });
+  startVoice();
 }
 function exitPrompter(){
   if(isRec()){ stopRecording(); return; } // goes to review
